@@ -154,18 +154,19 @@ func (th *topHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 type WebFrontEndImpl struct {
-	log               *log.Logger
-	db                *db.MemoryStore
-	nonce             *nonceMap
-	nonceErrPercent   int
-	authzReusePercent int
-	ordersPerPage     int
-	va                *va.VAImpl
-	ca                *ca.CAImpl
-	strict            bool
-	requireEAB        bool
-	retryAfterAuthz   int
-	retryAfterOrder   int
+	log                  *log.Logger
+	db                   *db.MemoryStore
+	nonce                *nonceMap
+	nonceErrPercent      int
+	authzReusePercent    int
+	ordersPerPage        int
+	va                   *va.VAImpl
+	ca                   *ca.CAImpl
+	strict               bool
+	requireEAB           bool
+	subdomainAuthAllowed bool
+	retryAfterAuthz      int
+	retryAfterOrder      int
 }
 
 const ToSURL = "data:text/plain,Do%20what%20thou%20wilt"
@@ -175,7 +176,7 @@ func New(
 	db *db.MemoryStore,
 	va *va.VAImpl,
 	ca *ca.CAImpl,
-	strict, requireEAB bool, retryAfterAuthz int, retryAfterOrder int) WebFrontEndImpl {
+	strict, requireEAB bool, subdomainAuthAllowed bool, retryAfterAuthz int, retryAfterOrder int) WebFrontEndImpl {
 	// Seed rand from the current time so test environments don't always have
 	// the same nonce rejection and sleep time patterns.
 	rand.Seed(time.Now().UnixNano())
@@ -226,18 +227,19 @@ func New(
 	log.Printf("Configured to show %d orders per page", ordersPerPage)
 
 	return WebFrontEndImpl{
-		log:               log,
-		db:                db,
-		nonce:             newNonceMap(),
-		nonceErrPercent:   nonceErrPercent,
-		authzReusePercent: authzReusePercent,
-		ordersPerPage:     ordersPerPage,
-		va:                va,
-		ca:                ca,
-		strict:            strict,
-		requireEAB:        requireEAB,
-		retryAfterAuthz:   retryAfterAuthz,
-		retryAfterOrder:   retryAfterOrder,
+		log:                  log,
+		db:                   db,
+		nonce:                newNonceMap(),
+		nonceErrPercent:      nonceErrPercent,
+		authzReusePercent:    authzReusePercent,
+		ordersPerPage:        ordersPerPage,
+		va:                   va,
+		ca:                   ca,
+		strict:               strict,
+		requireEAB:           requireEAB,
+		subdomainAuthAllowed: subdomainAuthAllowed,
+		retryAfterAuthz:      retryAfterAuthz,
+		retryAfterOrder:      retryAfterOrder,
 	}
 }
 
@@ -586,6 +588,7 @@ func (wfe *WebFrontEndImpl) relativeDirectory(request *http.Request, directory m
 	relativeDir["meta"] = map[string]interface{}{
 		"termsOfService":          ToSURL,
 		"externalAccountRequired": wfe.requireEAB,
+		"subdomainAuthAllowed":    wfe.subdomainAuthAllowed,
 	}
 
 	directoryJSON, err := marshalIndent(relativeDir)
@@ -1508,12 +1511,81 @@ func (wfe *WebFrontEndImpl) makeAuthorizations(order *core.Order, request *http.
 	for _, name := range order.Identifiers {
 		now := time.Now().UTC()
 		expires := now.Add(pendingAuthzExpire)
-		ident := acme.Identifier{
-			Type:  name.Type,
-			Value: name.Value,
+		var ident acme.Identifier
+
+		var authz *core.Authorization
+		setSubdomainAuthAllowed := false
+
+		// If subdomains is allowed, first check if there is any parent domain
+		// already  authorized up to the TLD, regardless of whether parentDomain
+		// is specified in the orderObject or not.
+		//
+		// If so, then we have found an authorization match
+		// and use that existing authorization
+		//
+		// if no existing authorized domain is found, then check if a parentDomain
+		// is specified in the Order obejct. If so, create the authorization and
+		// challenge for the parentDomain. If not, then create the authz for the identifier.
+
+		if wfe.subdomainAuthAllowed {
+			wfe.log.Printf("makeAuthorizations domain %s, parent %s\n", name.Value, name.ParentDomain)
+
+			var allDomains []string
+			var currentDomain string
+			parts := strings.Split(name.Value, ".")
+
+			// Split the identifier into all the subddomains above the account
+			// root domain (not the DNS root, the "account.com" root)
+			// So of course check that there are at least 3 parts i.e. one subdomain
+
+			if len(parts) > 2 {
+				currentDomain = parts[len(parts)-2] + "." + parts[len(parts)-1]
+
+				allDomains = append(allDomains, currentDomain)
+
+				for i := len(parts) - 2; i > 0; i-- {
+					stub := parts[i-1]
+					currentDomain = stub + "." + currentDomain
+					allDomains = append(allDomains, currentDomain)
+				}
+
+			} else {
+				allDomains = append(allDomains, name.Value)
+			}
+
+			wfe.log.Printf("allDomains %q\n", allDomains)
+
+			for _, currentDomain = range allDomains {
+				id := acme.Identifier{Type: name.Type, Value: currentDomain}
+				authz = wfe.db.FindValidAuthorization(order.AccountID, id)
+				if authz != nil {
+					wfe.log.Printf("FOUND %s\n", authz.Identifier.Value)
+					break
+				}
+			}
+
+			// Setup ident in case we hit the rand ignoring of authorizations
+			// below and we need to create a new authorization
+
+			// If pebble is configured for subdomains (wfe.subdomainAuthAllowed)
+			// and the client specified a parentDomain, then set the flag
+
+			if name.ParentDomain == "" {
+				ident = acme.Identifier{Type: name.Type, Value: name.Value}
+
+			} else {
+				ident = acme.Identifier{Type: name.Type, Value: name.ParentDomain}
+				setSubdomainAuthAllowed = true
+			}
+
+		} else {
+
+			// If there is an existing valid authz for this identifier, we can reuse it
+
+			ident = acme.Identifier{Type: name.Type, Value: name.Value}
+			authz = wfe.db.FindValidAuthorization(order.AccountID, ident)
 		}
-		// If there is an existing valid authz for this identifier, we can reuse it
-		authz := wfe.db.FindValidAuthorization(order.AccountID, ident)
+
 		// Otherwise create a new pending authz (and randomly not)
 		if authz == nil || rand.Intn(100) > wfe.authzReusePercent {
 			authz = &core.Authorization{
@@ -1527,6 +1599,11 @@ func (wfe *WebFrontEndImpl) makeAuthorizations(order *core.Order, request *http.
 				},
 			}
 			authz.URL = wfe.relativeEndpoint(request, fmt.Sprintf("%s%s", authzPath, authz.ID))
+
+			if setSubdomainAuthAllowed {
+				authz.Authorization.SubdomainAuthAllowed = true
+			}
+
 			// Create the challenges for this authz
 			err := wfe.makeChallenges(authz, request)
 			if err != nil {
@@ -1645,12 +1722,14 @@ func (wfe *WebFrontEndImpl) NewOrder(
 		return
 	}
 
-	var orderDNSs []string
+	// Work with OrderIds instead Values/DNSs so that
+	// we maintain the parentDomain assoicated with the correct Value
+	var orderIds []acme.Identifier
 	var orderIPs []net.IP
 	for _, ident := range newOrder.Identifiers {
 		switch ident.Type {
 		case acme.IdentifierDNS:
-			orderDNSs = append(orderDNSs, ident.Value)
+			orderIds = append(orderIds, acme.Identifier{Value: ident.Value, Type: acme.IdentifierDNS, ParentDomain: ident.ParentDomain})
 		case acme.IdentifierIP:
 			orderIPs = append(orderIPs, net.ParseIP(ident.Value))
 		default:
@@ -1659,11 +1738,11 @@ func (wfe *WebFrontEndImpl) NewOrder(
 			return
 		}
 	}
-	orderDNSs = uniqueLowerNames(orderDNSs)
+	orderIds = uniqueLowerIds(orderIds)
 	orderIPs = uniqueIPs(orderIPs)
 	var uniquenames []acme.Identifier
-	for _, name := range orderDNSs {
-		uniquenames = append(uniquenames, acme.Identifier{Value: name, Type: acme.IdentifierDNS})
+	for _, id := range orderIds {
+		uniquenames = append(uniquenames, id)
 	}
 	for _, ip := range orderIPs {
 		uniquenames = append(uniquenames, acme.Identifier{Value: ip.String(), Type: acme.IdentifierIP})
@@ -2538,6 +2617,22 @@ func uniqueLowerNames(names []string) []string {
 		unique = append(unique, name)
 	}
 	sort.Strings(unique)
+	return unique
+}
+
+// uniqueLowerIds returns the set of all unique names in the input
+// return them as acme.Identifier objects, with DNS names in lowercase
+func uniqueLowerIds(ids []acme.Identifier) []acme.Identifier {
+	idMap := make(map[string]acme.Identifier, len(ids))
+	for _, id := range ids {
+		idMap[strings.ToLower(id.Value)] = id
+	}
+	unique := make([]acme.Identifier, 0, len(idMap))
+	for _, id := range idMap {
+		id.Value = strings.ToLower(id.Value)
+		id.ParentDomain = strings.ToLower(id.ParentDomain)
+		unique = append(unique, id)
+	}
 	return unique
 }
 

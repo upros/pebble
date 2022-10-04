@@ -25,8 +25,9 @@ const (
 )
 
 type Identifier struct {
-	Type  string `json:"type"`
-	Value string `json:"value"`
+	Type         string `json:"type"`
+	Value        string `json:"value"`
+	ParentDomain string `json:"parentDomain,omitempty"`
 }
 
 func (ident Identifier) Equals(other Identifier) bool {
@@ -71,7 +72,8 @@ type Authorization struct {
 	// a `*.`wildcard prefix. This will help convey to users that an
 	// Authorization with the identifier `example.com` and one DNS-01 challenge
 	// corresponds to a name `*.example.com` from an associated order.
-	Wildcard bool `json:"wildcard,omitempty"`
+	Wildcard             bool `json:"wildcard,omitempty"`
+	SubdomainAuthAllowed bool `json:"subdomainAuthAllowed,omitempty"`
 }
 
 // A Challenge is used to validate an Authorization
