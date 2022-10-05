@@ -104,7 +104,7 @@ const (
 
 	// The default value when PEBBLE_WFE_AUTHZREUSE is not set, how often to try
 	// and reuse valid authorizations.
-	defaultAuthzReuse = 50
+	defaultAuthzReuse = 100
 
 	// ordersPerPageEnvVar defines the environment variable name used to provide
 	// the number of orders to show per page. To have the WFE show 15 orders per
@@ -2583,16 +2583,7 @@ func addNoCacheHeader(response http.ResponseWriter) {
 
 func addRetryAfterHeader(response http.ResponseWriter, second int) {
 	if second > 0 {
-		if rand.Intn(2) == 0 {
-			response.Header().Add("Retry-After", strconv.Itoa(second))
-		} else {
-			// IMF-fixdate
-			// see https://datatracker.ietf.org/doc/html/rfc7231#section-7.1.1.1
-			gmt, _ := time.LoadLocation("GMT")
-			currentTime := time.Now().In(gmt)
-			retryAfter := currentTime.Add(time.Second * time.Duration(second))
-			response.Header().Add("Retry-After", retryAfter.Format(http.TimeFormat))
-		}
+		response.Header().Add("Retry-After", strconv.Itoa(second))
 	}
 }
 
